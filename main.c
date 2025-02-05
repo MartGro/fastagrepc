@@ -5,6 +5,7 @@
 #include <zlib.h>
 
 #define BUFFER_SIZE (1024 * 1024)  // 1MB buffer
+#define OVERLAP_SIZE 1000          // Size of overlap between chunks
 #define MAX_PATTERNS 1000
 #define MAX_PATTERN_LENGTH 1000
 #define MAX_HEADER_LENGTH 1000
@@ -21,10 +22,26 @@ typedef struct {
     char header[MAX_HEADER_LENGTH];
     char* sequence;
     size_t position;
+    size_t global_position;  // Position in original sequence
     char pattern_name[256];
     char pattern_sequence[MAX_PATTERN_LENGTH];
     int strand;  // 0 for forward, 1 for reverse
 } FastaMatch;
+
+typedef struct {
+    char* data;
+    size_t length;
+    size_t capacity;
+    size_t global_offset;  // Track position in original sequence
+} SequenceBuffer;
+
+typedef struct {
+    SequenceBuffer forward;
+    SequenceBuffer reverse;
+    char* preprocessed;
+    char* rev_preprocessed;
+    size_t max_pattern_length;
+} ChunkProcessor;
 
 typedef struct ACNode {
     struct ACNode* children[ALPHABET_SIZE];
@@ -41,10 +58,9 @@ typedef struct {
     int capacity;
 } Queue;
 
-// Queue operations
 Queue* create_queue(int size) {
-    Queue* queue = (Queue*)malloc(sizeof(Queue));
-    queue->items = (ACNode**)malloc(size * sizeof(ACNode*));
+    Queue* queue = malloc(sizeof(Queue));
+    queue->items = malloc(size * sizeof(ACNode*));
     queue->front = queue->rear = -1;
     queue->capacity = size;
     return queue;
@@ -78,10 +94,9 @@ void free_queue(Queue* queue) {
     free(queue);
 }
 
-// Aho-Corasick node operations
 ACNode* create_node() {
-    ACNode* node = (ACNode*)calloc(1, sizeof(ACNode));
-    node->pattern_indices = (int*)malloc(10 * sizeof(int));
+    ACNode* node = calloc(1, sizeof(ACNode));
+    node->pattern_indices = malloc(10 * sizeof(int));
     node->capacity = 10;
     node->pattern_count = 0;
     return node;
@@ -104,7 +119,6 @@ void free_node(ACNode* node) {
     free(node);
 }
 
-// Build Aho-Corasick automaton
 ACNode* build_automaton(Pattern* patterns, int pattern_count, int ignore_case) {
     ACNode* root = create_node();
     
@@ -123,10 +137,8 @@ ACNode* build_automaton(Pattern* patterns, int pattern_count, int ignore_case) {
         add_pattern_to_node(current, i);
     }
     
-    // Build failure links using BFS
     Queue* queue = create_queue(pattern_count * MAX_PATTERN_LENGTH);
     
-    // Set root's children failure to root
     for (int i = 0; i < ALPHABET_SIZE; i++) {
         if (root->children[i]) {
             root->children[i]->failure = root;
@@ -146,7 +158,6 @@ ACNode* build_automaton(Pattern* patterns, int pattern_count, int ignore_case) {
                 
                 current->children[i]->failure = state ? state->children[i] : root;
                 
-                // Copy pattern indices from failure state
                 for (int j = 0; j < current->children[i]->failure->pattern_count; j++) {
                     add_pattern_to_node(current->children[i], 
                                       current->children[i]->failure->pattern_indices[j]);
@@ -161,7 +172,6 @@ ACNode* build_automaton(Pattern* patterns, int pattern_count, int ignore_case) {
     return root;
 }
 
-// Read patterns from CSV
 int read_patterns(const char* filepath, Pattern* patterns, int ignore_case) {
     FILE* file = fopen(filepath, "r");
     if (!file) {
@@ -184,7 +194,6 @@ int read_patterns(const char* filepath, Pattern* patterns, int ignore_case) {
             strncpy(patterns[count].sequence, seq, sizeof(patterns[count].sequence) - 1);
             patterns[count].length = strlen(seq);
             
-            // Create preprocessed version
             for (size_t i = 0; i < patterns[count].length; i++) {
                 patterns[count].preprocessed[i] = ignore_case ? 
                     tolower(seq[i]) : seq[i];
@@ -199,7 +208,6 @@ int read_patterns(const char* filepath, Pattern* patterns, int ignore_case) {
     return count;
 }
 
-// Search sequence using Aho-Corasick
 char complement(char c) {
     switch(toupper(c)) {
         case 'A': return 'T';
@@ -210,57 +218,149 @@ char complement(char c) {
     }
 }
 
-void create_reverse_complement(const char* sequence, char* reverse, size_t length) {
-    for (size_t i = 0; i < length; i++) {
-        reverse[i] = complement(sequence[length - 1 - i]);
-    }
-    reverse[length] = '\0';
+void init_sequence_buffer(SequenceBuffer* buf, size_t initial_capacity) {
+    buf->data = malloc(initial_capacity);
+    buf->length = 0;
+    buf->capacity = initial_capacity;
+    buf->global_offset = 0;
 }
 
-void search_sequence(const char* sequence, const char* original_sequence, size_t seq_length,
-                    ACNode* root, Pattern* patterns, const char* header,
-                    size_t context, int ignore_case, FastaMatch** matches, size_t* match_count) {
-    ACNode* current = root;
+ChunkProcessor* create_chunk_processor(size_t chunk_size, size_t max_pattern_len) {
+    ChunkProcessor* processor = malloc(sizeof(ChunkProcessor));
+    init_sequence_buffer(&processor->forward, chunk_size + max_pattern_len);
+    init_sequence_buffer(&processor->reverse, chunk_size + max_pattern_len);
+    processor->preprocessed = malloc(chunk_size + max_pattern_len);
+    processor->rev_preprocessed = malloc(chunk_size + max_pattern_len);
+    processor->max_pattern_length = max_pattern_len;
+    return processor;
+}
+
+void process_chunk(ChunkProcessor* processor, const char* new_data, size_t new_len,
+                  ACNode* root, Pattern* patterns, const char* header,
+                  size_t context, int ignore_case, FastaMatch** matches, size_t* match_count,
+                  int is_final_chunk) {
     
-    for (size_t i = 0; i < seq_length; i++) {
-        unsigned char c = ignore_case ? tolower(sequence[i]) : sequence[i];
+    if (processor->forward.length + new_len > processor->forward.capacity) {
+        size_t new_cap = processor->forward.capacity * 2;
+        processor->forward.data = realloc(processor->forward.data, new_cap);
+        processor->preprocessed = realloc(processor->preprocessed, new_cap);
+        processor->forward.capacity = new_cap;
+    }
+    
+    memcpy(processor->forward.data + processor->forward.length, new_data, new_len);
+    
+    for (size_t i = 0; i < new_len; i++) {
+        processor->preprocessed[processor->forward.length + i] = 
+            ignore_case ? tolower(new_data[i]) : new_data[i];
+    }
+    
+    processor->forward.length += new_len;
+    
+    if (processor->forward.length >= OVERLAP_SIZE || is_final_chunk) {
+        size_t process_len = is_final_chunk ? processor->forward.length : 
+                            processor->forward.length - processor->max_pattern_length;
         
-        while (current != root && !current->children[c]) {
-            current = current->failure;
-        }
-        
-        current = current->children[c] ? current->children[c] : root;
-        
-        if (current->pattern_count > 0) {
-            for (int j = 0; j < current->pattern_count; j++) {
-                int pattern_idx = current->pattern_indices[j];
-                size_t pattern_len = patterns[pattern_idx].length;
-                size_t start_pos = i - pattern_len + 1;
-                
-                // Extend matches array
-                *matches = realloc(*matches, (*match_count + 1) * sizeof(FastaMatch));
-                FastaMatch* match = &(*matches)[*match_count];
-                
-                strncpy(match->header, header, MAX_HEADER_LENGTH - 1);
-                match->position = start_pos;
-                strncpy(match->pattern_name, patterns[pattern_idx].name, 255);
-                strncpy(match->pattern_sequence, patterns[pattern_idx].sequence, MAX_PATTERN_LENGTH - 1);
-                
-                // Extract context
-                size_t ctx_start = start_pos > context ? start_pos - context : 0;
-                size_t ctx_end = (start_pos + pattern_len + context) < seq_length ? 
-                                 start_pos + pattern_len + context : seq_length;
-                
-                size_t ctx_len = ctx_end - ctx_start;
-                match->sequence = malloc(ctx_len + 1);
-                strncpy(match->sequence, &original_sequence[ctx_start], ctx_len);
-                match->sequence[ctx_len] = '\0';
-                
-                match->strand = 0;  // forward strand
-                (*match_count)++;
+        ACNode* current = root;
+        for (size_t i = 0; i < process_len; i++) {
+            unsigned char c = processor->preprocessed[i];
+            while (current != root && !current->children[c]) {
+                current = current->failure;
+            }
+            current = current->children[c] ? current->children[c] : root;
+            
+            if (current->pattern_count > 0) {
+                for (int j = 0; j < current->pattern_count; j++) {
+                    int pattern_idx = current->pattern_indices[j];
+                    size_t global_pos = processor->forward.global_offset + i;
+                    
+                    *matches = realloc(*matches, (*match_count + 1) * sizeof(FastaMatch));
+                    FastaMatch* match = &(*matches)[*match_count];
+                    
+                    strncpy(match->header, header, MAX_HEADER_LENGTH - 1);
+                    match->position = i - patterns[pattern_idx].length + 1;
+                    match->global_position = global_pos - patterns[pattern_idx].length + 1;
+                    strncpy(match->pattern_name, patterns[pattern_idx].name, 255);
+                    strncpy(match->pattern_sequence, patterns[pattern_idx].sequence, MAX_PATTERN_LENGTH - 1);
+                    
+                    size_t ctx_start = match->position > context ? match->position - context : 0;
+                    size_t ctx_end = (match->position + patterns[pattern_idx].length + context) < process_len ? 
+                                    match->position + patterns[pattern_idx].length + context : process_len;
+                    
+                    size_t ctx_len = ctx_end - ctx_start;
+                    match->sequence = malloc(ctx_len + 1);
+                    strncpy(match->sequence, &processor->forward.data[ctx_start], ctx_len);
+                    match->sequence[ctx_len] = '\0';
+                    match->strand = 0;
+                    
+                    (*match_count)++;
+                }
             }
         }
+        
+        // Process reverse complement
+        char* rev_seq = malloc(process_len);
+        for (size_t i = 0; i < process_len; i++) {
+            rev_seq[i] = complement(processor->forward.data[process_len - 1 - i]);
+            processor->rev_preprocessed[i] = ignore_case ? tolower(rev_seq[i]) : rev_seq[i];
+        }
+        
+        current = root;
+        for (size_t i = 0; i < process_len; i++) {
+            unsigned char c = processor->rev_preprocessed[i];
+            while (current != root && !current->children[c]) {
+                current = current->failure;
+            }
+            current = current->children[c] ? current->children[c] : root;
+            
+            if (current->pattern_count > 0) {
+                for (int j = 0; j < current->pattern_count; j++) {
+                    int pattern_idx = current->pattern_indices[j];
+                    size_t global_pos = processor->forward.global_offset + process_len - 1 - i;
+                    
+                    *matches = realloc(*matches, (*match_count + 1) * sizeof(FastaMatch));
+                    FastaMatch* match = &(*matches)[*match_count];
+                    
+                    strncpy(match->header, header, MAX_HEADER_LENGTH - 1);
+                    match->position = global_pos;
+                    match->global_position = global_pos;
+                    strncpy(match->pattern_name, patterns[pattern_idx].name, 255);
+                    strncpy(match->pattern_sequence, patterns[pattern_idx].sequence, MAX_PATTERN_LENGTH - 1);
+                    
+                    size_t rev_ctx_start = i > context ? i - context : 0;
+                    size_t rev_ctx_end = i + patterns[pattern_idx].length + context;
+                    if (rev_ctx_end > process_len) rev_ctx_end = process_len;
+                    
+                    size_t ctx_len = rev_ctx_end - rev_ctx_start;
+                    match->sequence = malloc(ctx_len + 1);
+                    for (size_t k = 0; k < ctx_len; k++) {
+                        match->sequence[k] = rev_seq[rev_ctx_start + k];
+                    }
+                    match->sequence[ctx_len] = '\0';
+                    match->strand = 1;
+                    
+                    (*match_count)++;
+                }
+            }
+        }
+        
+        free(rev_seq);
+        
+        if (!is_final_chunk) {
+            memmove(processor->forward.data, 
+                   processor->forward.data + process_len,
+                   processor->forward.length - process_len);
+            processor->forward.length -= process_len;
+            processor->forward.global_offset += process_len;
+        }
     }
+}
+
+void free_chunk_processor(ChunkProcessor* processor) {
+    free(processor->forward.data);
+    free(processor->reverse.data);
+    free(processor->preprocessed);
+    free(processor->rev_preprocessed);
+    free(processor);
 }
 
 int main(int argc, char* argv[]) {
@@ -276,125 +376,69 @@ int main(int argc, char* argv[]) {
     int sequence_only = argc > 4 ? atoi(argv[4]) : 0;
     int ignore_case = argc > 5 ? atoi(argv[5]) : 0;
     
-    // Read patterns
     Pattern patterns[MAX_PATTERNS];
     int pattern_count = read_patterns(patterns_file, patterns, ignore_case);
     if (pattern_count < 0) return 1;
     
-    printf("Loaded %d patterns\n", pattern_count);
+    fprintf(stderr,"Loaded %d patterns\n", pattern_count);
     
-    // Build Aho-Corasick automaton
+    size_t max_pattern_len = 0;
+    for (int i = 0; i < pattern_count; i++) {
+        if (patterns[i].length > max_pattern_len) {
+            max_pattern_len = patterns[i].length;
+        }
+    }
+    
     ACNode* root = build_automaton(patterns, pattern_count, ignore_case);
     
-    // Process FASTA file
     gzFile fp = gzopen(fasta_file, "r");
     if (!fp) {
         perror("Error opening FASTA file");
         return 1;
     }
     
-    char* buffer = malloc(BUFFER_SIZE);
-    char* sequence = NULL;
-    char* preprocessed = NULL;
-    size_t seq_capacity = 0;
-    size_t seq_length = 0;
-    char current_header[MAX_HEADER_LENGTH] = "";
+    ChunkProcessor* processor = create_chunk_processor(BUFFER_SIZE, max_pattern_len);
     FastaMatch* matches = NULL;
     size_t match_count = 0;
-    size_t last_match_count = 0;
-    
-    while (gzgets(fp, buffer, BUFFER_SIZE)) {
-        if (buffer[0] == '>') {
-            // Process previous sequence if exists
-            if (seq_length > 0) {
-                sequence[seq_length] = '\0';
-                preprocessed[seq_length] = '\0';
-                
-                // Create reverse complement
-                char* reverse_seq = malloc(seq_length + 1);
-                char* reverse_preprocessed = malloc(seq_length + 1);
-                create_reverse_complement(sequence, reverse_seq, seq_length);
-                for (size_t i = 0; i < seq_length; i++) {
-                    reverse_preprocessed[i] = ignore_case ? tolower(reverse_seq[i]) : reverse_seq[i];
-                }
-                reverse_preprocessed[seq_length] = '\0';
-                
-                // Search forward strand
-                last_match_count = match_count;
-                search_sequence(preprocessed, sequence, seq_length,
-                              root, patterns, current_header,
-                              context, ignore_case, &matches, &match_count);
-                
-                seq_length = 0;
-            }
-            
-            // Store new header
-            strncpy(current_header, buffer + 1, MAX_HEADER_LENGTH - 1);
-            current_header[strcspn(current_header, "\n")] = 0;
-        } else {
-            size_t line_len = strlen(buffer);
-            buffer[strcspn(buffer, "\n")] = 0;
-            
-            // Resize buffers if needed
-            if (seq_length + line_len >= seq_capacity) {
-                seq_capacity = seq_capacity == 0 ? BUFFER_SIZE : seq_capacity * 2;
-                sequence = realloc(sequence, seq_capacity);
-                preprocessed = realloc(preprocessed, seq_capacity);
-                if (!sequence || !preprocessed) {
-                    fprintf(stderr, "Memory allocation failed\n");
-                    return 1;
-                }
-            }
-            
-            // Add sequence data
-            for (size_t i = 0; buffer[i]; i++) {
-                char c = buffer[i];
-                if (!isspace(c)) {
-                    sequence[seq_length] = c;
-                    preprocessed[seq_length] = ignore_case ? tolower(c) : c;
-                    seq_length++;
-                }
-            }
-        }
-    }
-    
-    // Process final sequence
-    if (seq_length > 0) {
-        sequence[seq_length] = '\0';
-        preprocessed[seq_length] = '\0';
-        
-        // Create reverse complement
-        char* reverse_seq = malloc(seq_length + 1);
-        char* reverse_preprocessed = malloc(seq_length + 1);
-        create_reverse_complement(sequence, reverse_seq, seq_length);
-        for (size_t i = 0; i < seq_length; i++) {
-            reverse_preprocessed[i] = ignore_case ? tolower(reverse_seq[i]) : reverse_seq[i];
-        }
-        reverse_preprocessed[seq_length] = '\0';
-        
-        // Search forward strand
-        search_sequence(preprocessed, sequence, seq_length,
-                      root, patterns, current_header,
-                      context, ignore_case, &matches, &match_count);
-                      
-        // Search reverse strand
-        search_sequence(reverse_preprocessed, reverse_seq, seq_length,
-                      root, patterns, current_header,
-                      context, ignore_case, &matches, &match_count);
-        
-        // Mark reverse strand matches
-        for (size_t i = last_match_count; i < match_count; i++) {
-            matches[i].strand = 1;  // reverse strand
-            // Convert position to forward strand coordinates
-            matches[i].position = seq_length - matches[i].position - 1;
-        }
-                      
-        free(reverse_seq);
-        free(reverse_preprocessed);
-    }
+    char current_header[MAX_HEADER_LENGTH] = "";
+    char buffer[BUFFER_SIZE];
+    int in_header = 0;
     
     // Print CSV header
     printf("header,pattern_name,pattern_sequence,position,strand,context\n");
+    
+    while (1) {
+        size_t bytes_read = gzread(fp, buffer, BUFFER_SIZE);
+        if (bytes_read == 0) break;
+        
+        char* line_start = buffer;
+        char* current = buffer;
+        char* end = buffer + bytes_read;
+        
+        while (current < end) {
+            if (*current == '>' || current == end - 1) {
+                if (in_header) {
+                    // Store header
+                    size_t header_len = current - line_start;
+                    if (header_len > MAX_HEADER_LENGTH - 1) 
+                        header_len = MAX_HEADER_LENGTH - 1;
+                    strncpy(current_header, line_start + 1, header_len);
+                    current_header[header_len] = '\0';
+                    current_header[strcspn(current_header, "\n")] = 0;
+                } else if (current - line_start > 0) {
+                    // Process sequence chunk
+                    process_chunk(processor, line_start, current - line_start,
+                                root, patterns, current_header, context,
+                                ignore_case, &matches, &match_count,
+                                bytes_read < BUFFER_SIZE);
+                }
+                
+                in_header = (*current == '>');
+                line_start = current;
+            }
+            current++;
+        }
+    }
     
     // Print matches in CSV format
     for (size_t i = 0; i < match_count; i++) {
@@ -413,7 +457,7 @@ int main(int argc, char* argv[]) {
                header,
                pattern_name,
                pattern_sequence,
-               matches[i].position,
+               matches[i].global_position,
                matches[i].strand ? "reverse" : "forward",
                sequence);
                
@@ -425,9 +469,7 @@ int main(int argc, char* argv[]) {
     }
     
     // Cleanup
-    free(buffer);
-    free(sequence);
-    free(preprocessed);
+    free_chunk_processor(processor);
     free(matches);
     free_node(root);
     gzclose(fp);
